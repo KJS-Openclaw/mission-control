@@ -676,6 +676,32 @@ const migrations: Migration[] = [
       db.exec(`CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_workspace_id ON webhook_deliveries(workspace_id)`)
       db.exec(`CREATE INDEX IF NOT EXISTS idx_token_usage_workspace_id ON token_usage(workspace_id)`)
     }
+  },
+  {
+    id: '024_audit_log_workspace_scope',
+    up: (db) => {
+      const auditTableExists = db
+        .prepare(`SELECT 1 as ok FROM sqlite_master WHERE type = 'table' AND name = 'audit_log'`)
+        .get() as { ok?: number } | undefined
+
+      if (!auditTableExists?.ok) return
+
+      const cols = db.prepare('PRAGMA table_info(audit_log)').all() as Array<{ name: string }>
+      if (!cols.some((col) => col.name === 'workspace_id')) {
+        db.exec('ALTER TABLE audit_log ADD COLUMN workspace_id INTEGER NOT NULL DEFAULT 1')
+      }
+
+      db.exec(`
+        UPDATE audit_log
+        SET workspace_id = COALESCE(
+          workspace_id,
+          (SELECT workspace_id FROM users WHERE users.id = audit_log.actor_id),
+          1
+        )
+      `)
+
+      db.exec('CREATE INDEX IF NOT EXISTS idx_audit_log_workspace_id ON audit_log(workspace_id)')
+    }
   }
 ]
 

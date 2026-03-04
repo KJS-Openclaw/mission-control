@@ -485,6 +485,7 @@ export function logAuditEvent(event: {
   action: string
   actor: string
   actor_id?: number
+  workspace_id?: number
   target_type?: string
   target_id?: number
   detail?: any
@@ -492,13 +493,20 @@ export function logAuditEvent(event: {
   user_agent?: string
 }) {
   const db = getDatabase()
+  const resolvedWorkspaceId =
+    event.workspace_id ??
+    (event.actor_id
+      ? (db.prepare('SELECT workspace_id FROM users WHERE id = ?').get(event.actor_id) as { workspace_id?: number } | undefined)?.workspace_id
+      : undefined) ??
+    1
   db.prepare(`
-    INSERT INTO audit_log (action, actor, actor_id, target_type, target_id, detail, ip_address, user_agent)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO audit_log (action, actor, actor_id, workspace_id, target_type, target_id, detail, ip_address, user_agent)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     event.action,
     event.actor,
     event.actor_id ?? null,
+    resolvedWorkspaceId,
     event.target_type ?? null,
     event.target_id ?? null,
     event.detail ? JSON.stringify(event.detail) : null,

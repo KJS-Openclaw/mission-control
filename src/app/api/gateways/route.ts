@@ -22,7 +22,7 @@ function ensureTable(db: ReturnType<typeof getDatabase>) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS gateways (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL,
       host TEXT NOT NULL DEFAULT '127.0.0.1',
       port INTEGER NOT NULL DEFAULT 18789,
       token TEXT NOT NULL DEFAULT '',
@@ -32,10 +32,20 @@ function ensureTable(db: ReturnType<typeof getDatabase>) {
       latency INTEGER,
       sessions_count INTEGER NOT NULL DEFAULT 0,
       agents_count INTEGER NOT NULL DEFAULT 0,
+      workspace_id INTEGER NOT NULL DEFAULT 1,
       created_at INTEGER NOT NULL DEFAULT (unixepoch()),
       updated_at INTEGER NOT NULL DEFAULT (unixepoch())
     )
   `)
+
+  const cols = db.prepare('PRAGMA table_info(gateways)').all() as Array<{ name: string }>
+  if (!cols.some((col) => col.name === 'workspace_id')) {
+    db.exec('ALTER TABLE gateways ADD COLUMN workspace_id INTEGER NOT NULL DEFAULT 1')
+    db.exec('UPDATE gateways SET workspace_id = COALESCE(workspace_id, 1)')
+  }
+
+  db.exec('CREATE INDEX IF NOT EXISTS idx_gateways_workspace_id ON gateways(workspace_id)')
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_gateways_workspace_name ON gateways(workspace_id, name)')
 }
 
 /**
@@ -47,8 +57,9 @@ export async function GET(request: NextRequest) {
 
   const db = getDatabase()
   ensureTable(db)
+  const workspaceId = auth.user.workspace_id ?? 1
 
-  const gateways = db.prepare('SELECT * FROM gateways ORDER BY is_primary DESC, name ASC').all() as GatewayEntry[]
+  const gateways = db.prepare('SELECT * FROM gateways WHERE workspace_id = ? ORDER BY is_primary DESC, name ASC').all(workspaceId) as GatewayEntry[]
 
   // If no gateways exist, seed defaults from environment
   if (gateways.length === 0) {
@@ -61,10 +72,10 @@ export async function GET(request: NextRequest) {
       ''
 
     db.prepare(`
-      INSERT INTO gateways (name, host, port, token, is_primary) VALUES (?, ?, ?, ?, 1)
-    `).run(name, host, mainPort, mainToken)
+      INSERT INTO gateways (name, host, port, token, is_primary, workspace_id) VALUES (?, ?, ?, ?, 1, ?)
+    `).run(name, host, mainPort, mainToken, workspaceId)
 
-    const seeded = db.prepare('SELECT * FROM gateways ORDER BY is_primary DESC, name ASC').all() as GatewayEntry[]
+    const seeded = db.prepare('SELECT * FROM gateways WHERE workspace_id = ? ORDER BY is_primary DESC, name ASC').all(workspaceId) as GatewayEntry[]
     return NextResponse.json({ gateways: redactTokens(seeded) })
   }
 
@@ -80,6 +91,7 @@ export async function POST(request: NextRequest) {
 
   const db = getDatabase()
   ensureTable(db)
+  const workspaceId = auth.user.workspace_id ?? 1
   const body = await request.json()
 
   const { name, host, port, token, is_primary } = body
@@ -91,12 +103,12 @@ export async function POST(request: NextRequest) {
   try {
     // If marking as primary, unset other primaries
     if (is_primary) {
-      db.prepare('UPDATE gateways SET is_primary = 0').run()
+      db.prepare('UPDATE gateways SET is_primary = 0 WHERE workspace_id = ?').run(workspaceId)
     }
 
     const result = db.prepare(`
-      INSERT INTO gateways (name, host, port, token, is_primary) VALUES (?, ?, ?, ?, ?)
-    `).run(name, host, port, token || '', is_primary ? 1 : 0)
+      INSERT INTO gateways (name, host, port, token, is_primary, workspace_id) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(name, host, port, token || '', is_primary ? 1 : 0, workspaceId)
 
     try {
       db.prepare('INSERT INTO audit_log (action, actor, detail) VALUES (?, ?, ?)').run(
@@ -104,7 +116,7 @@ export async function POST(request: NextRequest) {
       )
     } catch { /* audit might not exist */ }
 
-    const gw = db.prepare('SELECT * FROM gateways WHERE id = ?').get(result.lastInsertRowid) as GatewayEntry
+    const gw = db.prepare('SELECT * FROM gateways WHERE id = ? AND workspace_id = ?').get(result.lastInsertRowid, workspaceId) as GatewayEntry
     return NextResponse.json({ gateway: redactToken(gw) }, { status: 201 })
   } catch (err: any) {
     if (err.message?.includes('UNIQUE')) {
@@ -123,17 +135,18 @@ export async function PUT(request: NextRequest) {
 
   const db = getDatabase()
   ensureTable(db)
+  const workspaceId = auth.user.workspace_id ?? 1
   const body = await request.json()
   const { id, ...updates } = body
 
   if (!id) return NextResponse.json({ error: 'id is required' }, { status: 400 })
 
-  const existing = db.prepare('SELECT * FROM gateways WHERE id = ?').get(id) as GatewayEntry | undefined
+  const existing = db.prepare('SELECT * FROM gateways WHERE id = ? AND workspace_id = ?').get(id, workspaceId) as GatewayEntry | undefined
   if (!existing) return NextResponse.json({ error: 'Gateway not found' }, { status: 404 })
 
   // If setting as primary, unset others
   if (updates.is_primary) {
-    db.prepare('UPDATE gateways SET is_primary = 0').run()
+    db.prepare('UPDATE gateways SET is_primary = 0 WHERE workspace_id = ?').run(workspaceId)
   }
 
   const allowed = ['name', 'host', 'port', 'token', 'is_primary', 'status', 'last_seen', 'latency', 'sessions_count', 'agents_count']
@@ -152,9 +165,9 @@ export async function PUT(request: NextRequest) {
   sets.push('updated_at = (unixepoch())')
   values.push(id)
 
-  db.prepare(`UPDATE gateways SET ${sets.join(', ')} WHERE id = ?`).run(...values)
+  db.prepare(`UPDATE gateways SET ${sets.join(', ')} WHERE id = ? AND workspace_id = ?`).run(...values, workspaceId)
 
-  const updated = db.prepare('SELECT * FROM gateways WHERE id = ?').get(id) as GatewayEntry
+  const updated = db.prepare('SELECT * FROM gateways WHERE id = ? AND workspace_id = ?').get(id, workspaceId) as GatewayEntry
   return NextResponse.json({ gateway: redactToken(updated) })
 }
 
@@ -167,17 +180,18 @@ export async function DELETE(request: NextRequest) {
 
   const db = getDatabase()
   ensureTable(db)
+  const workspaceId = auth.user.workspace_id ?? 1
   const body = await request.json()
   const { id } = body
 
   if (!id) return NextResponse.json({ error: 'id is required' }, { status: 400 })
 
-  const gw = db.prepare('SELECT * FROM gateways WHERE id = ?').get(id) as GatewayEntry | undefined
+  const gw = db.prepare('SELECT * FROM gateways WHERE id = ? AND workspace_id = ?').get(id, workspaceId) as GatewayEntry | undefined
   if (gw?.is_primary) {
     return NextResponse.json({ error: 'Cannot delete the primary gateway' }, { status: 400 })
   }
 
-  const result = db.prepare('DELETE FROM gateways WHERE id = ?').run(id)
+  const result = db.prepare('DELETE FROM gateways WHERE id = ? AND workspace_id = ?').run(id, workspaceId)
 
   try {
     db.prepare('INSERT INTO audit_log (action, actor, detail) VALUES (?, ?, ?)').run(

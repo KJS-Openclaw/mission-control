@@ -21,6 +21,7 @@ interface TokenUsageRecord {
   cost: number
   operation: string
   duration?: number
+  workspaceId?: number
 }
 
 interface TokenStats {
@@ -77,17 +78,19 @@ interface DbTokenUsageRow {
   input_tokens: number
   output_tokens: number
   created_at: number
+  workspace_id?: number
 }
 
-function loadTokenDataFromDb(): TokenUsageRecord[] {
+function loadTokenDataFromDb(workspaceId: number): TokenUsageRecord[] {
   try {
     const db = getDatabase()
     const rows = db.prepare(`
-      SELECT id, model, session_id, input_tokens, output_tokens, created_at
+      SELECT id, model, session_id, input_tokens, output_tokens, created_at, workspace_id
       FROM token_usage
+      WHERE workspace_id = ?
       ORDER BY created_at DESC, id DESC
       LIMIT 10000
-    `).all() as DbTokenUsageRow[]
+    `).all(workspaceId) as DbTokenUsageRow[]
 
     return rows.map((row) => {
       const totalTokens = row.input_tokens + row.output_tokens
@@ -103,6 +106,7 @@ function loadTokenDataFromDb(): TokenUsageRecord[] {
         totalTokens,
         cost: (totalTokens / 1000) * costPer1k,
         operation: 'heartbeat',
+        workspaceId: row.workspace_id ?? workspaceId,
       }
     })
   } catch (error) {
@@ -129,6 +133,7 @@ function normalizeTokenRecord(record: Partial<TokenUsageRecord>): TokenUsageReco
     cost: Number(record.cost ?? (totalTokens / 1000) * getModelCost(model)),
     operation: String(record.operation ?? 'chat_completion'),
     duration: record.duration,
+    workspaceId: Number(record.workspaceId ?? 1),
   }
 }
 
@@ -174,16 +179,21 @@ async function loadTokenDataFromFile(): Promise<TokenUsageRecord[]> {
 /**
  * Load token data from persistent file, falling back to deriving from session stores.
  */
-async function loadTokenData(): Promise<TokenUsageRecord[]> {
-  const dbRecords = loadTokenDataFromDb()
+async function loadTokenData(workspaceId: number): Promise<TokenUsageRecord[]> {
+  const dbRecords = loadTokenDataFromDb(workspaceId)
   const fileRecords = await loadTokenDataFromFile()
-  const combined = dedupeTokenRecords([...dbRecords, ...fileRecords]).sort((a, b) => b.timestamp - a.timestamp)
+  const scopedFileRecords = fileRecords.filter((record) => (record.workspaceId ?? 1) === workspaceId)
+  const combined = dedupeTokenRecords([...dbRecords, ...scopedFileRecords]).sort((a, b) => b.timestamp - a.timestamp)
   if (combined.length > 0) {
     return combined
   }
 
-  // Final fallback: derive from in-memory sessions
-  return deriveFromSessions()
+  // Final fallback: in-memory sessions are not workspace-scoped, so only use for default workspace.
+  if (workspaceId === 1) {
+    return deriveFromSessions().map((record) => ({ ...record, workspaceId }))
+  }
+
+  return []
 }
 
 /**
@@ -284,8 +294,9 @@ export async function GET(request: NextRequest) {
     const action = searchParams.get('action') || 'list'
     const timeframe = searchParams.get('timeframe') || 'all'
     const format = searchParams.get('format') || 'json'
+    const workspaceId = auth.user.workspace_id ?? 1
 
-    const tokenData = await loadTokenData()
+    const tokenData = await loadTokenData(workspaceId)
     const filteredData = filterByTimeframe(tokenData, timeframe)
 
     if (action === 'list') {
@@ -525,6 +536,7 @@ export async function POST(request: NextRequest) {
       cost,
       operation,
       duration,
+      workspaceId: auth.user.workspace_id ?? 1,
     }
 
     // Persist only manually posted usage records in the JSON file.
