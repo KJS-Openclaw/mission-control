@@ -95,14 +95,17 @@ export function proxy(request: NextRequest) {
   // Check for session cookie
   const sessionToken = request.cookies.get('mc-session')?.value
 
-  // API routes: accept session cookie OR API key
+  // API routes: only pre-auth with API key in proxy.
+  // Session cookie validity must be enforced inside each route handler
+  // (e.g., via requireRole/getUserFromRequest), because proxy can only
+  // check cookie presence, not DB-backed session validity.
   if (pathname.startsWith('/api/')) {
     const apiKey = request.headers.get('x-api-key')
-    if (sessionToken || (apiKey && safeCompare(apiKey, process.env.API_KEY || ''))) {
+    if (apiKey && safeCompare(apiKey, process.env.API_KEY || '')) {
       return applySecurityHeaders(NextResponse.next())
     }
 
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    return applySecurityHeaders(NextResponse.next())
   }
 
   // Page routes: redirect to login if no session
