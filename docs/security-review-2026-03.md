@@ -67,3 +67,11 @@ This document captures a targeted security review of the repository, with concre
   - Multi-workspace tests proving non-admin users cannot read another workspace’s gateway/token/export data.
   - Unit tests for IP extraction consistency.
   - SSRF safety tests for webhook URL validation/egress policy.
+
+## Implemented hardening updates (this repo revision)
+
+- Added workspace scoping for `/api/gateways` CRUD and default seeding behavior by persisting `workspace_id` and filtering all reads/writes by the caller workspace.
+- Updated `/api/tokens` to scope database/file-backed usage records by workspace and avoid non-scoped in-memory fallback outside the default workspace.
+- Scoped `/api/export` for `pipelines` by `workspace_id`, and tightened `audit` exports to workspace-bound records (using `workspace_id` when available, with actor-based fallback for legacy rows).
+- Added migration `024_audit_log_workspace_scope` to add/index `audit_log.workspace_id` and backfill from `users.workspace_id` when `actor_id` is present.
+- Updated `logAuditEvent` to persist `workspace_id` for new audit records (explicit or derived from actor).

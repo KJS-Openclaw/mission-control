@@ -29,6 +29,8 @@ export async function GET(request: NextRequest) {
 
   const db = getDatabase()
   const workspaceId = auth.user.workspace_id ?? 1
+  const auditColumns = db.prepare('PRAGMA table_info(audit_log)').all() as Array<{ name: string }>
+  const auditHasWorkspaceId = auditColumns.some((column) => column.name === 'workspace_id')
   const conditions: string[] = []
   const params: any[] = []
 
@@ -53,7 +55,20 @@ export async function GET(request: NextRequest) {
 
   switch (type) {
     case 'audit': {
-      rows = db.prepare(`SELECT * FROM audit_log ${where} ORDER BY created_at DESC LIMIT ?`).all(...params, limit)
+      if (auditHasWorkspaceId) {
+        const scopedConditions = ['workspace_id = ?', ...conditions]
+        const scopedParams = [workspaceId, ...params]
+        const scopedWhere = `WHERE ${scopedConditions.join(' AND ')}`
+        rows = db.prepare(`SELECT * FROM audit_log ${scopedWhere} ORDER BY created_at DESC LIMIT ?`).all(...scopedParams, limit)
+      } else {
+        const scopedConditions = [
+          '(actor_id IN (SELECT id FROM users WHERE workspace_id = ?) OR actor_id IS NULL)',
+          ...conditions,
+        ]
+        const scopedParams = [workspaceId, ...params]
+        const scopedWhere = `WHERE ${scopedConditions.join(' AND ')}`
+        rows = db.prepare(`SELECT * FROM audit_log ${scopedWhere} ORDER BY created_at DESC LIMIT ?`).all(...scopedParams, limit)
+      }
       headers = ['id', 'action', 'actor', 'actor_id', 'target_type', 'target_id', 'detail', 'ip_address', 'user_agent', 'created_at']
       filename = 'audit-log'
       break
@@ -77,7 +92,10 @@ export async function GET(request: NextRequest) {
       break
     }
     case 'pipelines': {
-      rows = db.prepare(`SELECT pr.*, wp.name as pipeline_name FROM pipeline_runs pr LEFT JOIN workflow_pipelines wp ON pr.pipeline_id = wp.id ${where ? where.replace('created_at', 'pr.created_at') : ''} ORDER BY pr.created_at DESC LIMIT ?`).all(...params, limit)
+      const pipelineConditions = ['pr.workspace_id = ?', ...conditions.map((condition) => condition.replaceAll('created_at', 'pr.created_at'))]
+      const pipelineParams = [workspaceId, ...params]
+      const pipelineWhere = `WHERE ${pipelineConditions.join(' AND ')}`
+      rows = db.prepare(`SELECT pr.*, wp.name as pipeline_name FROM pipeline_runs pr LEFT JOIN workflow_pipelines wp ON pr.pipeline_id = wp.id ${pipelineWhere} ORDER BY pr.created_at DESC LIMIT ?`).all(...pipelineParams, limit)
       headers = ['id', 'pipeline_id', 'pipeline_name', 'status', 'current_step', 'steps_snapshot', 'started_at', 'completed_at', 'triggered_by', 'created_at']
       filename = 'pipeline-runs'
       break
