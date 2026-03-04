@@ -678,6 +678,48 @@ const migrations: Migration[] = [
     }
   },
   {
+    id: '025_api_tokens',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS api_tokens (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          workspace_id INTEGER NOT NULL DEFAULT 1,
+          name TEXT NOT NULL,
+          token_hash TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'viewer',
+          scopes_json TEXT NOT NULL DEFAULT '[]',
+          expires_at INTEGER,
+          last_used_at INTEGER,
+          revoked_at INTEGER,
+          created_by INTEGER,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+        CREATE INDEX IF NOT EXISTS idx_api_tokens_workspace_id ON api_tokens(workspace_id);
+        CREATE INDEX IF NOT EXISTS idx_api_tokens_expires_at ON api_tokens(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_api_tokens_revoked_at ON api_tokens(revoked_at);
+      `)
+    }
+  },
+  {
+    id: '026_integration_secret_metadata',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS integration_secrets (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          workspace_id INTEGER NOT NULL DEFAULT 1,
+          secret_key TEXT NOT NULL,
+          backend TEXT NOT NULL DEFAULT 'env-file',
+          last_rotated_at INTEGER,
+          updated_by INTEGER,
+          created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+          UNIQUE(workspace_id, secret_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_integration_secrets_workspace_id ON integration_secrets(workspace_id);
+      `)
+    }
+  },
+  {
     id: '024_audit_log_workspace_scope',
     up: (db) => {
       const auditTableExists = db

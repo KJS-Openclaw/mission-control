@@ -39,6 +39,9 @@ jobs:
       - name: Unit tests
         run: pnpm test
 
+      - name: API auth policy coverage
+        run: pnpm check:api-auth-policy
+
       - name: Prepare E2E environment
         run: cp .env.test .env
 

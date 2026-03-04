@@ -179,3 +179,58 @@ export const githubSyncSchema = z.object({
   body: z.string().optional(),
   comment: z.string().optional(),
 })
+
+
+export const scopedApiTokenCreateSchema = z.object({
+  name: z.string().min(1).max(120),
+  role: z.enum(['admin', 'operator', 'viewer']).default('viewer'),
+  scopes: z.array(z.enum(['read:*', 'tasks:write', 'agents:write', 'config:write', 'integrations:write'])).default(['read:*']),
+  expiresAt: z.number().int().positive().nullable().optional(),
+})
+
+const integrationAllowedKeys = [
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'OPENROUTER_API_KEY',
+  'NVIDIA_API_KEY',
+  'MOONSHOT_API_KEY',
+  'OLLAMA_API_KEY',
+  'BRAVE_API_KEY',
+  'X_COOKIES_PATH',
+  'LINKEDIN_ACCESS_TOKEN',
+  'TELEGRAM_BOT_TOKEN',
+  'GITHUB_TOKEN',
+  'OP_SERVICE_ACCOUNT_TOKEN',
+  'OPENCLAW_GATEWAY_TOKEN',
+] as const
+
+export const integrationsUpdateSchema = z.object({
+  vars: z.record(z.enum(integrationAllowedKeys), z.union([z.string(), z.number(), z.boolean()])),
+  confirmToken: z.string().optional(),
+})
+
+export const integrationsDeleteSchema = z.object({
+  keys: z.array(z.enum(integrationAllowedKeys)).min(1),
+  confirmToken: z.string().optional(),
+})
+
+const gatewayConfigAllowed = {
+  'gateway.host': z.string().min(1),
+  'gateway.port': z.number().int().min(1).max(65535),
+  'gateway.auth.username': z.string().min(1),
+  'gateway.auth.enabled': z.boolean(),
+  'gateway.timeoutMs': z.number().int().min(100).max(120000),
+  'gateway.retries': z.number().int().min(0).max(10),
+  'logging.level': z.enum(['debug', 'info', 'warn', 'error']),
+} as const
+
+export const gatewayConfigAllowedPathSchema = z.enum(Object.keys(gatewayConfigAllowed) as [keyof typeof gatewayConfigAllowed, ...(keyof typeof gatewayConfigAllowed)[]])
+
+export const gatewayConfigPatchSchema = z.object({
+  updates: z.record(gatewayConfigAllowedPathSchema, z.unknown()),
+  confirmToken: z.string().optional(),
+})
+
+export function validateGatewayConfigValue(path: keyof typeof gatewayConfigAllowed, value: unknown) {
+  return gatewayConfigAllowed[path].safeParse(value)
+}

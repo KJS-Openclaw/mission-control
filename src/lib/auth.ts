@@ -1,4 +1,4 @@
-import { randomBytes, timingSafeEqual } from 'crypto'
+import { randomBytes, scryptSync, timingSafeEqual } from 'crypto'
 import { getDatabase } from './db'
 import { hashPassword, verifyPassword } from './password'
 
@@ -31,6 +31,184 @@ export interface User {
   created_at: number
   updated_at: number
   last_login_at: number | null
+}
+
+
+export interface ApiTokenRecord {
+  id: number
+  workspace_id: number
+  name: string
+  role: 'admin' | 'operator' | 'viewer'
+  scopes: string[]
+  expires_at: number | null
+  last_used_at: number | null
+  revoked_at: number | null
+  created_by: number | null
+  created_at: number
+}
+
+function isLegacyApiKeyEnabled(): boolean {
+  const raw = String(process.env.MC_LEGACY_API_KEY || '').trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
+}
+
+function hashApiToken(rawToken: string, salt?: string): string {
+  const resolvedSalt = salt || randomBytes(16).toString('hex')
+  const derived = scryptSync(rawToken, resolvedSalt, 64).toString('hex')
+  return `scrypt:${resolvedSalt}:${derived}`
+}
+
+function verifyApiToken(rawToken: string, tokenHash: string): boolean {
+  const [algorithm, salt, digest] = String(tokenHash).split(':')
+  if (algorithm !== 'scrypt' || !salt || !digest) return false
+  const computed = hashApiToken(rawToken, salt)
+  return safeCompare(computed, tokenHash)
+}
+
+function parseTokenScopes(scopesJson: string | null | undefined): string[] {
+  if (!scopesJson) return []
+  try {
+    const parsed = JSON.parse(scopesJson)
+    return Array.isArray(parsed) ? parsed.map((scope) => String(scope)) : []
+  } catch {
+    return []
+  }
+}
+
+export function createScopedApiToken(input: {
+  workspaceId: number
+  name: string
+  role: 'admin' | 'operator' | 'viewer'
+  scopes: string[]
+  expiresAt?: number | null
+  createdBy?: number | null
+}): { token: string; record: ApiTokenRecord } {
+  const db = getDatabase()
+  const rawToken = randomBytes(32).toString('hex')
+  const tokenHash = hashApiToken(rawToken)
+  const result = db.prepare(`
+    INSERT INTO api_tokens (workspace_id, name, token_hash, role, scopes_json, expires_at, created_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    input.workspaceId,
+    input.name,
+    tokenHash,
+    input.role,
+    JSON.stringify(input.scopes || []),
+    input.expiresAt ?? null,
+    input.createdBy ?? null,
+  )
+
+  const row = db.prepare(`
+    SELECT id, workspace_id, name, role, scopes_json, expires_at, last_used_at, revoked_at, created_by, created_at
+    FROM api_tokens WHERE id = ?
+  `).get(result.lastInsertRowid) as any
+
+  return {
+    token: rawToken,
+    record: {
+      id: Number(row.id),
+      workspace_id: Number(row.workspace_id),
+      name: String(row.name),
+      role: row.role,
+      scopes: parseTokenScopes(row.scopes_json),
+      expires_at: row.expires_at ?? null,
+      last_used_at: row.last_used_at ?? null,
+      revoked_at: row.revoked_at ?? null,
+      created_by: row.created_by ?? null,
+      created_at: Number(row.created_at),
+    },
+  }
+}
+
+export function listScopedApiTokens(workspaceId: number): ApiTokenRecord[] {
+  const db = getDatabase()
+  const rows = db.prepare(`
+    SELECT id, workspace_id, name, role, scopes_json, expires_at, last_used_at, revoked_at, created_by, created_at
+    FROM api_tokens
+    WHERE workspace_id = ?
+    ORDER BY created_at DESC, id DESC
+  `).all(workspaceId) as any[]
+
+  return rows.map((row) => ({
+    id: Number(row.id),
+    workspace_id: Number(row.workspace_id),
+    name: String(row.name),
+    role: row.role,
+    scopes: parseTokenScopes(row.scopes_json),
+    expires_at: row.expires_at ?? null,
+    last_used_at: row.last_used_at ?? null,
+    revoked_at: row.revoked_at ?? null,
+    created_by: row.created_by ?? null,
+    created_at: Number(row.created_at),
+  }))
+}
+
+export function revokeScopedApiToken(workspaceId: number, tokenId: number): boolean {
+  const db = getDatabase()
+  const result = db.prepare(`
+    UPDATE api_tokens
+    SET revoked_at = (unixepoch())
+    WHERE id = ? AND workspace_id = ? AND revoked_at IS NULL
+  `).run(tokenId, workspaceId)
+  return result.changes > 0
+}
+
+export function authenticateScopedApiToken(rawToken: string): ApiTokenRecord | null {
+  if (!rawToken) return null
+  const now = Math.floor(Date.now() / 1000)
+
+  if (isLegacyApiKeyEnabled() && safeCompare(rawToken, process.env.API_KEY || '')) {
+    return {
+      id: 0,
+      workspace_id: getDefaultWorkspaceId(),
+      name: 'legacy_api_key',
+      role: 'admin',
+      scopes: ['*'],
+      expires_at: null,
+      last_used_at: now,
+      revoked_at: null,
+      created_by: null,
+      created_at: 0,
+    }
+  }
+
+  try {
+    const db = getDatabase()
+    const candidates = db.prepare(`
+      SELECT id, workspace_id, name, token_hash, role, scopes_json, expires_at, last_used_at, revoked_at, created_by, created_at
+      FROM api_tokens
+      WHERE revoked_at IS NULL
+        AND (expires_at IS NULL OR expires_at > ?)
+    `).all(now) as any[]
+
+    for (const row of candidates) {
+      if (!verifyApiToken(rawToken, String(row.token_hash || ''))) continue
+
+      db.prepare('UPDATE api_tokens SET last_used_at = ? WHERE id = ?').run(now, row.id)
+      return {
+        id: Number(row.id),
+        workspace_id: Number(row.workspace_id),
+        name: String(row.name),
+        role: row.role,
+        scopes: parseTokenScopes(row.scopes_json),
+        expires_at: row.expires_at ?? null,
+        last_used_at: now,
+        revoked_at: row.revoked_at ?? null,
+        created_by: row.created_by ?? null,
+        created_at: Number(row.created_at),
+      }
+    }
+  } catch {
+    return null
+  }
+
+  return null
+}
+
+export function tokenHasScope(scopes: string[], requiredScope: string): boolean {
+  if (scopes.includes('*') || scopes.includes('read:*')) return true
+  return scopes.includes(requiredScope)
 }
 
 export interface UserSession {
@@ -276,18 +454,21 @@ export function getUserFromRequest(request: Request): User | null {
     if (user) return user
   }
 
-  // Check API key - return synthetic user
+  // Check scoped API token (legacy API_KEY only when explicitly enabled)
   const apiKey = request.headers.get('x-api-key')
-  if (apiKey && safeCompare(apiKey, process.env.API_KEY || '')) {
-    return {
-      id: 0,
-      username: 'api',
-      display_name: 'API Access',
-      role: 'admin',
-      workspace_id: getDefaultWorkspaceId(),
-      created_at: 0,
-      updated_at: 0,
-      last_login_at: null,
+  if (apiKey) {
+    const token = authenticateScopedApiToken(apiKey)
+    if (token) {
+      return {
+        id: 0,
+        username: 'api',
+        display_name: `API Token (${token.name})`,
+        role: token.role,
+        workspace_id: token.workspace_id || getDefaultWorkspaceId(),
+        created_at: 0,
+        updated_at: 0,
+        last_login_at: null,
+      }
     }
   }
 
