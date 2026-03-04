@@ -5,8 +5,10 @@ import { config } from '@/lib/config'
 import { join } from 'path'
 import { readFile, writeFile, rename } from 'fs/promises'
 import { execFileSync } from 'child_process'
-import { validateBody, integrationActionSchema } from '@/lib/validation'
+import { validateBody, integrationActionSchema, integrationsDeleteSchema, integrationsUpdateSchema } from '@/lib/validation'
 import { mutationLimiter } from '@/lib/rate-limit'
+import { getSecretValue, listSecretsMetadata, removeSecrets, setSecrets } from '@/lib/secrets-provider'
+import { createHash } from 'node:crypto'
 
 // ---------------------------------------------------------------------------
 // Integration registry
@@ -159,18 +161,9 @@ function checkOpAvailable(): boolean {
  */
 async function getOpEnv(): Promise<NodeJS.ProcessEnv> {
   const base: NodeJS.ProcessEnv = { ...process.env }
-  // Already in process env? Use it.
   if (base.OP_SERVICE_ACCOUNT_TOKEN) return base
-  // Try reading from the OpenClaw .env
-  const envData = await readEnvFile()
-  if (envData) {
-    for (const line of envData.lines) {
-      if (line.type === 'var' && line.key === 'OP_SERVICE_ACCOUNT_TOKEN' && line.value) {
-        base.OP_SERVICE_ACCOUNT_TOKEN = line.value
-        break
-      }
-    }
-  }
+  const token = await getSecretValue('OP_SERVICE_ACCOUNT_TOKEN')
+  if (token) base.OP_SERVICE_ACCOUNT_TOKEN = token
   return base
 }
 
@@ -189,25 +182,25 @@ export async function GET(request: NextRequest) {
 
   const envMap = new Map<string, string>()
   for (const line of envData.lines) {
-    if (line.type === 'var' && line.key) {
-      envMap.set(line.key, line.value!)
-    }
+    if (line.type === 'var' && line.key) envMap.set(line.key, line.value || '')
   }
+  const metadata = await listSecretsMetadata(auth.user.workspace_id)
+  const metaByKey = new Map(metadata.map((m) => [m.key, m]))
 
   const opAvailable = checkOpAvailable()
 
   const integrations = INTEGRATIONS.map(def => {
-    const vars: Record<string, { redacted: string; set: boolean }> = {}
+    const vars: Record<string, { redacted: string; set: boolean; lastRotatedAt: number | null }> = {}
     let allSet = true
     let anySet = false
 
     for (const envVar of def.envVars) {
       const val = envMap.get(envVar)
       if (val && val.length > 0) {
-        vars[envVar] = { redacted: redactValue(val), set: true }
+        vars[envVar] = { redacted: redactValue(val), set: true, lastRotatedAt: metaByKey.get(envVar)?.lastRotatedAt ?? null }
         anySet = true
       } else {
-        vars[envVar] = { redacted: '', set: false }
+        vars[envVar] = { redacted: '', set: false, lastRotatedAt: metaByKey.get(envVar)?.lastRotatedAt ?? null }
         allSet = false
       }
     }
@@ -245,51 +238,49 @@ export async function PUT(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
-  const body = await request.json().catch(() => null)
-  if (!body?.vars || typeof body.vars !== 'object') {
-    return NextResponse.json({ error: 'vars object required' }, { status: 400 })
-  }
+  const parsed = await validateBody(request, integrationsUpdateSchema)
+  if ('error' in parsed) return parsed.error
+  const body = parsed.data
 
   for (const key of Object.keys(body.vars)) {
-    if (isVarBlocked(key)) {
-      return NextResponse.json({ error: `Cannot set protected variable: ${key}` }, { status: 403 })
-    }
-    if (!/^[A-Z_][A-Z0-9_]*$/i.test(key)) {
-      return NextResponse.json({ error: `Invalid variable name: ${key}` }, { status: 400 })
-    }
+    if (isVarBlocked(key)) return NextResponse.json({ error: `Cannot set protected variable: ${key}` }, { status: 403 })
   }
 
-  const envData = await readEnvFile()
-  if (!envData) {
-    return NextResponse.json({ error: 'OPENCLAW_HOME not configured' }, { status: 404 })
+  const highRiskKeys = Object.keys(body.vars).filter((k) => ['OP_SERVICE_ACCOUNT_TOKEN', 'OPENCLAW_GATEWAY_TOKEN'].includes(k))
+  const expectedConfirmToken = createHash('sha256').update(Object.keys(body.vars).sort().join(',')).digest('hex').slice(0, 24)
+  if (highRiskKeys.length > 0 && body.confirmToken !== expectedConfirmToken) {
+    return NextResponse.json({
+      error: 'High-risk integration update requires confirmation',
+      requiresConfirmation: true,
+      confirmToken: expectedConfirmToken,
+      highRiskKeys,
+    }, { status: 409 })
   }
 
-  const { lines } = envData
-  const updatedKeys: string[] = []
+  const previous: Record<string, string | null> = {}
+  for (const key of Object.keys(body.vars)) previous[key] = await getSecretValue(key)
 
-  for (const [key, value] of Object.entries(body.vars)) {
-    const strValue = String(value)
-    const existing = lines.find(l => l.type === 'var' && l.key === key)
+  const dryRun = request.nextUrl.searchParams.get('dryRun') === '1'
+  const diff = Object.entries(body.vars).map(([key, value]) => ({
+    key,
+    before: previous[key] ? redactValue(String(previous[key])) : '',
+    after: String(value) ? redactValue(String(value)) : '',
+  }))
 
-    if (existing) {
-      existing.value = strValue
-    } else {
-      if (lines.length > 0 && lines[lines.length - 1].type !== 'blank') {
-        lines.push({ type: 'blank', raw: '' })
-      }
-      lines.push({ type: 'var', raw: `${key}=${strValue}`, key, value: strValue })
-    }
-    updatedKeys.push(key)
-  }
+  if (dryRun) return NextResponse.json({ dryRun: true, diff, count: diff.length })
 
-  await writeEnvFile(lines)
+  const updatedKeys = await setSecrets({
+    workspaceId: auth.user.workspace_id,
+    values: Object.fromEntries(Object.entries(body.vars).map(([k, v]) => [k, String(v)])),
+    updatedBy: auth.user.id,
+  })
 
   const ipAddress = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown'
   logAuditEvent({
     action: 'integrations_update',
     actor: auth.user.username,
     actor_id: auth.user.id,
-    detail: { updated_keys: updatedKeys },
+    detail: { diff },
     ip_address: ipAddress,
   })
 
@@ -304,41 +295,18 @@ export async function DELETE(request: NextRequest) {
   const auth = requireRole(request, 'admin')
   if ('error' in auth) return NextResponse.json({ error: auth.error }, { status: auth.status })
 
-  let body: any
-  try { body = await request.json() } catch { return NextResponse.json({ error: 'Request body required' }, { status: 400 }) }
-  const keysParam = Array.isArray(body.keys) ? body.keys.join(',') : body.keys
-  if (!keysParam) {
-    return NextResponse.json({ error: 'keys parameter required (comma-separated string or array)' }, { status: 400 })
+  const parsed = await validateBody(request, integrationsDeleteSchema)
+  if ('error' in parsed) return parsed.error
+
+  for (const key of parsed.data.keys) {
+    if (isVarBlocked(key)) return NextResponse.json({ error: `Cannot remove protected variable: ${key}` }, { status: 403 })
   }
 
-  const keysToRemove = new Set<string>(keysParam.split(',').map((k: string) => k.trim()).filter(Boolean))
-  if (keysToRemove.size === 0) {
-    return NextResponse.json({ error: 'At least one key required' }, { status: 400 })
-  }
+  const dryRun = request.nextUrl.searchParams.get('dryRun') === '1'
+  const before = await Promise.all(parsed.data.keys.map(async (key) => ({ key, exists: !!(await getSecretValue(key)) })))
+  if (dryRun) return NextResponse.json({ dryRun: true, diff: before, count: before.length })
 
-  for (const key of keysToRemove) {
-    if (isVarBlocked(key)) {
-      return NextResponse.json({ error: `Cannot remove protected variable: ${key}` }, { status: 403 })
-    }
-  }
-
-  const envData = await readEnvFile()
-  if (!envData) {
-    return NextResponse.json({ error: 'OPENCLAW_HOME not configured' }, { status: 404 })
-  }
-
-  const removed: string[] = []
-  const newLines = envData.lines.filter(l => {
-    if (l.type === 'var' && l.key && keysToRemove.has(l.key)) {
-      removed.push(l.key)
-      return false
-    }
-    return true
-  })
-
-  if (removed.length > 0) {
-    await writeEnvFile(newLines)
-  }
+  const removed = await removeSecrets({ workspaceId: auth.user.workspace_id, keys: parsed.data.keys, updatedBy: auth.user.id })
 
   const ipAddress = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown'
   logAuditEvent({

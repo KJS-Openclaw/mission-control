@@ -1,15 +1,8 @@
-import crypto from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
-
-/** Constant-time string comparison using Node.js crypto. */
-function safeCompare(a: string, b: string): boolean {
-  if (typeof a !== 'string' || typeof b !== 'string') return false
-  const bufA = Buffer.from(a)
-  const bufB = Buffer.from(b)
-  if (bufA.length !== bufB.length) return false
-  return crypto.timingSafeEqual(bufA, bufB)
-}
+import { getApiRoutePolicy, getRequiredScopeForRequest, roleSatisfies } from '@/lib/route-policy'
+import { authenticateScopedApiToken, tokenHasScope, validateSession } from '@/lib/auth'
 
 function envFlag(name: string): boolean {
   const raw = process.env[name]
@@ -45,10 +38,30 @@ function hostMatches(pattern: string, hostname: string): boolean {
   return h === p
 }
 
-function applySecurityHeaders(response: NextResponse): NextResponse {
+function buildCsp(nonce: string): string {
+  const googleEnabled = !!(process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || process.env.GOOGLE_CLIENT_ID)
+  return [
+    "default-src 'self'",
+    `script-src 'self' 'nonce-${nonce}'${googleEnabled ? ' https://accounts.google.com' : ''}`,
+    `style-src 'self' 'nonce-${nonce}'`,
+    "frame-ancestors 'none'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "connect-src 'self' ws: wss: http://127.0.0.1:* http://localhost:*",
+    `img-src 'self' data: blob:${googleEnabled ? ' https://*.googleusercontent.com https://lh3.googleusercontent.com' : ''}`,
+    "font-src 'self' data:",
+    `frame-src 'self'${googleEnabled ? ' https://accounts.google.com' : ''}`,
+  ].join('; ')
+}
+
+function applySecurityHeaders(response: NextResponse, nonce: string): NextResponse {
   response.headers.set('X-Content-Type-Options', 'nosniff')
   response.headers.set('X-Frame-Options', 'DENY')
   response.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin')
+  response.headers.set('x-mc-csp-nonce', nonce)
+  const csp = buildCsp(nonce)
+  const enforce = String(process.env.MC_CSP_ENFORCE || '').trim() === '1'
+  response.headers.set(enforce ? 'Content-Security-Policy' : 'Content-Security-Policy-Report-Only', csp)
   return response
 }
 
@@ -70,6 +83,7 @@ export function proxy(request: NextRequest) {
   }
 
   const { pathname } = request.nextUrl
+  const cspNonce = randomBytes(16).toString('base64')
 
   // CSRF Origin validation for mutating requests
   const method = request.method.toUpperCase()
@@ -82,35 +96,53 @@ export function proxy(request: NextRequest) {
         || request.nextUrl.host
         || ''
       if (originHost && requestHost && originHost !== requestHost) {
-        return NextResponse.json({ error: 'CSRF origin mismatch' }, { status: 403 })
+        return applySecurityHeaders(NextResponse.json({ error: 'CSRF origin mismatch' }, { status: 403 }), cspNonce)
       }
     }
   }
 
-  // Allow login page, auth API, and docs without session
-  if (pathname === '/login' || pathname.startsWith('/api/auth/') || pathname === '/api/docs' || pathname === '/docs') {
-    return applySecurityHeaders(NextResponse.next())
+  // Allow public pages without session
+  if (pathname === '/login' || pathname === '/docs') {
+    return applySecurityHeaders(NextResponse.next(), cspNonce)
   }
 
   // Check for session cookie
   const sessionToken = request.cookies.get('mc-session')?.value
 
-  // API routes: only pre-auth with API key in proxy.
-  // Session cookie validity must be enforced inside each route handler
-  // (e.g., via requireRole/getUserFromRequest), because proxy can only
-  // check cookie presence, not DB-backed session validity.
   if (pathname.startsWith('/api/')) {
-    const apiKey = request.headers.get('x-api-key')
-    if (apiKey && safeCompare(apiKey, process.env.API_KEY || '')) {
-      return applySecurityHeaders(NextResponse.next())
+    const policy = getApiRoutePolicy(pathname)
+    if (!policy) {
+      return applySecurityHeaders(NextResponse.json({ error: 'Forbidden' }, { status: 403 }), cspNonce)
     }
 
-    return applySecurityHeaders(NextResponse.next())
+    if (policy.access === 'public') {
+      return applySecurityHeaders(NextResponse.next(), cspNonce)
+    }
+
+    if (sessionToken) {
+      const sessionUser = validateSession(sessionToken)
+      if (sessionUser && roleSatisfies(sessionUser.role, policy.access)) {
+        return applySecurityHeaders(NextResponse.next(), cspNonce)
+      }
+    }
+
+    const apiKey = request.headers.get('x-api-key')
+    if (policy.apiKeyAllowed && apiKey) {
+      const token = authenticateScopedApiToken(apiKey)
+      if (token && roleSatisfies(token.role, policy.access)) {
+        const requiredScope = getRequiredScopeForRequest(pathname, method)
+        if (tokenHasScope(token.scopes, requiredScope)) {
+          return applySecurityHeaders(NextResponse.next(), cspNonce)
+        }
+      }
+    }
+
+    return applySecurityHeaders(NextResponse.json({ error: 'Forbidden' }, { status: 403 }), cspNonce)
   }
 
   // Page routes: redirect to login if no session
   if (sessionToken) {
-    return applySecurityHeaders(NextResponse.next())
+    return applySecurityHeaders(NextResponse.next(), cspNonce)
   }
 
   // Redirect to login

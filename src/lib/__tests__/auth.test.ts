@@ -48,7 +48,7 @@ describe('requireRole', () => {
   const originalEnv = process.env
 
   beforeEach(() => {
-    process.env = { ...originalEnv, API_KEY: 'test-api-key-secret' }
+    process.env = { ...originalEnv, API_KEY: 'test-api-key-secret', MC_LEGACY_API_KEY: '1' }
   })
 
   afterEach(() => {
